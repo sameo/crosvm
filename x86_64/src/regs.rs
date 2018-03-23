@@ -262,7 +262,9 @@ fn configure_segments_and_sregs(mem: &GuestMemory, sregs: &mut kvm_sregs) -> Res
 
     /* 64-bit protected mode */
     sregs.cr0 |= X86_CR0_PE;
-    sregs.efer |= ::msr_index::EFER_LME as u64;
+
+    /* Enable and activate Long Mode */
+    sregs.efer |= ::msr_index::EFER_LME as u64 | ::msr_index::EFER_LMA as u64;
 
     Ok(())
 }
