@@ -208,8 +208,6 @@ const X86_CR0_PE: u64 = 0x1;
 const X86_CR0_PG: u64 = 0x80000000;
 const X86_CR4_PAE: u64 = 0x20;
 
-const EFER_LME: u64 = 0x100;
-
 const BOOT_GDT_OFFSET: u64 = 0x500;
 const BOOT_IDT_OFFSET: u64 = 0x520;
 
@@ -264,7 +262,7 @@ fn configure_segments_and_sregs(mem: &GuestMemory, sregs: &mut kvm_sregs) -> Res
 
     /* 64-bit protected mode */
     sregs.cr0 |= X86_CR0_PE;
-    sregs.efer |= EFER_LME;
+    sregs.efer |= ::msr_index::EFER_LME as u64;
 
     Ok(())
 }
