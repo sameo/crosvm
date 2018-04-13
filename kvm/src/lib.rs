@@ -17,6 +17,8 @@ use std::collections::hash_map::Entry;
 use std::mem::size_of;
 use std::os::raw::*;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::thread;
+use std::time::Duration;
 
 use libc::{open, O_RDWR, O_CLOEXEC, EINVAL, ENOSPC, ENOENT};
 use libc::sigset_t;
@@ -816,7 +818,17 @@ impl Vcpu {
                     };
                     match io.direction as u32 {
                         KVM_EXIT_IO_IN => Ok(VcpuExit::IoIn(port, data_slice)),
-                        KVM_EXIT_IO_OUT => Ok(VcpuExit::IoOut(port, data_slice)),
+                        KVM_EXIT_IO_OUT => {
+                            if port == 0x99 || port == 0x98 {
+                                println!("IO VM Exit on 0x{:x}", port);
+                                if port == 0x99 {
+                                    println!("Sleeping for 30s...");
+                                    thread::sleep(Duration::from_secs(30))
+                                }
+                            }
+
+                            Ok(VcpuExit::IoOut(port, data_slice))
+                        },
                         _ => Err(Error::new(EINVAL)),
                     }
                 },
