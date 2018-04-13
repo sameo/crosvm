@@ -160,6 +160,45 @@ impl Kvm {
     pub fn get_emulated_cpuid(&self) -> Result<CpuId> {
         self.get_cpuid(KVM_GET_EMULATED_CPUID())
     }
+
+    fn get_msr_entries(&self) -> Result<Vec<kvm_msr_entry>> {
+        let nmsrs = 256;
+        let vec_size_bytes = size_of::<kvm_msr_list>() +
+                             (nmsrs as usize * size_of::<u32>());
+        let vec: Vec<u8> = vec![0; vec_size_bytes];
+        let msr_list: &mut kvm_msr_list = unsafe {
+            // Converting the vector's memory to a struct is unsafe.  Carefully using the read-only
+            // vector to size and set the members ensures no out-of-bounds errors below.
+            &mut *(vec.as_ptr() as *mut kvm_msr_list)
+        };
+
+        msr_list.nmsrs = nmsrs;
+        let ret = unsafe {
+            // Here we trust the kernel not to read or write past the end of the kvm_msr_list struct.
+            ioctl_with_ref(self, KVM_GET_MSR_INDEX_LIST(), msr_list)
+        };
+        if ret < 0 {
+            return errno_result();
+        }
+
+        let mut indices: Vec<u32> = vec![0; msr_list.nmsrs as usize];
+        unsafe {
+            let msr_indices: &mut [u32] = msr_list.indices.as_mut_slice(msr_list.nmsrs as usize);
+            indices.copy_from_slice(&msr_indices);
+        }
+
+        let mut msr_entries = Vec::<kvm_msr_entry>::new();
+
+        for index in indices {
+            msr_entries.push(kvm_msr_entry {
+                index: index,
+                data: 0x0,
+                ..Default::default()
+            });
+        }
+
+        Ok(msr_entries)
+    }
 }
 
 impl AsRawFd for Kvm {
@@ -195,12 +234,37 @@ pub struct IrqRoute {
     pub source: IrqSource,
 }
 
+#[derive(Default)]
+pub struct VcpuState {
+    fd: RawFd,
+    regs: Option<VcpuStateRegs>,
+}
+
+impl VcpuState {
+    pub fn get_regs(&self) -> Result<&Option<VcpuStateRegs>> {
+        Ok((&self.regs))
+    }
+}
+
+#[derive(Default)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub struct VcpuStateRegs {
+    sregs: kvm_sregs,
+    regs: kvm_regs,
+    fpu: kvm_fpu,
+    xsave: kvm_xsave,
+    xcrs: kvm_xcrs,
+    mp_state: kvm_mp_state,
+    msrs: Vec<kvm_msr_entry>,
+}
+
 /// A wrapper around creating and using a VM.
 pub struct Vm {
     vm: File,
     guest_mem: GuestMemory,
     device_memory: HashMap<u32, MemoryMapping>,
     mem_slot_gaps: BinaryHeap<i32>,
+    vcpu_states: Vec<VcpuState>,
 }
 
 impl Vm {
@@ -227,10 +291,34 @@ impl Vm {
                 guest_mem: guest_mem,
                 device_memory: HashMap::new(),
                 mem_slot_gaps: BinaryHeap::new(),
+                vcpu_states: Vec::new(),
             })
         } else {
             errno_result()
         }
+    }
+
+    /// Takes a VCPU snapshot and store the VCPU state in memory.
+    ///
+    /// Fetches and stores all vCPU registers, segment registers, MP state and MSRs.
+    pub fn snapshot(&mut self, kvm: &Kvm) -> Result<()> {
+        for vcpu_state in self.vcpu_states.iter_mut() {
+            match vcpu_state.regs {
+                None => {
+                    /*
+                     * There are no stored registers for that VCPU.
+                     * Let's fetch all data and cache it.
+                     */
+                    let vcpu = unsafe { Vcpu::from_raw_fd(&kvm, vcpu_state.fd).unwrap()};
+                    let vcpu_regs = vcpu.get_state_regs(&kvm)?;
+
+                    vcpu_state.regs = Some(vcpu_regs);
+                },
+                Some(_) => { /* We already have some cached data */},
+            }
+        }
+
+        Ok(())
     }
 
     /// Checks if a particular `Cap` is available.
@@ -347,6 +435,21 @@ impl Vm {
     /// this VM was constructed.
     pub fn get_memory(&self) -> &GuestMemory {
         &self.guest_mem
+    }
+
+    /// Adds a VCPU fd to be tracked as part of the VM.
+    pub fn add_vcpu(&mut self, fd: RawFd) {
+        let state = VcpuState {
+            fd: fd,
+            ..Default::default()
+        };
+
+        self.vcpu_states.push(state);
+    }
+
+    /// Gets the VCPU states vector.
+    pub fn get_vcpu_states(&self) -> &Vec<VcpuState> {
+        &self.vcpu_states
     }
 
     /// Sets the address of the three-page region in the VM's address space.
@@ -674,6 +777,18 @@ impl Vcpu {
         unsafe { &mut *(self.run_mmap.as_ptr() as *mut kvm_run) }
     }
 
+    unsafe fn from_raw_fd(kvm: &Kvm, fd: RawFd) -> Result<Vcpu> {
+        let run_mmap_size = kvm.get_vcpu_mmap_size()?;
+        let vcpu = File::from_raw_fd(fd);
+        let run_mmap = MemoryMapping::from_fd(&vcpu, run_mmap_size)
+            .map_err(|_| Error::new(ENOSPC))?;
+
+        Ok(Vcpu {
+            vcpu: vcpu,
+            run_mmap: run_mmap
+        })
+    }
+
     /// Runs the VCPU until it exits, returning the reason.
     ///
     /// Note that the state of the VCPU and associated VM must be setup first for this to do
@@ -974,6 +1089,36 @@ impl Vcpu {
         Ok(())
     }
 
+    /// Copies a set of MSRs.
+    ///
+    /// # Arguments
+    ///
+    /// * `vcpu` - Structure for the vcpu that holds the vcpu fd.
+    /// * `msr_entries` - All MSRs entries to copy
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn copy_msrs(&self, msr_entries: &Vec<kvm_msr_entry>) -> Result<()> {
+        let vec_size_bytes = size_of::<kvm_msrs>() +
+            (msr_entries.len() * size_of::<kvm_msr_entry>());
+        let vec: Vec<u8> = Vec::with_capacity(vec_size_bytes);
+        let msrs: &mut kvm_msrs = unsafe {
+            // Converting the vector's memory to a struct is unsafe.  Carefully using the read-only
+            // vector to size and set the members ensures no out-of-bounds erros below.
+            &mut *(vec.as_ptr() as *mut kvm_msrs)
+        };
+
+        unsafe {
+            // Mapping the unsized array to a slice is unsafe becase the length isn't known.  Providing
+            // the length used to create the struct guarantees the entire slice is valid.
+            let entries: &mut [kvm_msr_entry] = msrs.entries.as_mut_slice(msr_entries.len());
+            entries.copy_from_slice(msr_entries);
+        }
+        msrs.nmsrs = msr_entries.len() as u32;
+
+        self.set_msrs(msrs)?;
+
+        Ok(())
+    }
+
     /// X86 specific call to setup the CPUID registers
     ///
     /// See the documentation for KVM_SET_CPUID2.
@@ -1059,6 +1204,65 @@ impl Vcpu {
         if ret < 0 {
             return errno_result();
         }
+        Ok(())
+    }
+
+    /// Gets all current MSRs for a given VCPU.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    pub fn get_current_msrs(&self, kvm: &Kvm) -> Result<Vec<kvm_msr_entry>> {
+        let mut msrs = kvm.get_msr_entries()?;
+        self.get_msrs(msrs.as_mut_slice())?;
+        Ok((msrs))
+    }
+
+    /// Gets all VCPU state registers.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn get_state_regs(&self, kvm: &Kvm) -> Result<(VcpuStateRegs)> {
+        let parent_sregs = self.get_sregs()?;
+        let parent_regs = self.get_regs()?;
+        let parent_fpu = self.get_fpu()?;
+        let parent_xsave = self.get_xsave()?;
+        let parent_xcrs = self.get_xcrs()?;
+        let parent_mp_state = self.get_mp_state()?;
+        let parent_msrs = self.get_current_msrs(kvm)?;
+
+        let vcpu_regs = VcpuStateRegs {
+            sregs: parent_sregs,
+            regs: parent_regs,
+            fpu: parent_fpu,
+            xsave: parent_xsave,
+            xcrs: parent_xcrs,
+            mp_state: parent_mp_state,
+            msrs: parent_msrs,
+        };
+
+        Ok((vcpu_regs))
+    }
+
+    /// Sets all VCPU state registers.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    pub fn set_state_regs(&self, regs: &VcpuStateRegs) -> Result<()> {
+        /* Registers */
+        self.set_regs(&regs.regs)?;
+
+        /* FPU registers */
+        self.set_fpu(&regs.fpu)?;
+
+        /* XSAVE */
+        self.set_xsave(&regs.xsave)?;
+
+        /* Segment registers */
+        self.set_sregs(&regs.sregs)?;
+
+        /* XCRs */
+        self.set_xcrs(&regs.xcrs)?;
+
+        /* MP state */
+        self.set_mp_state(&regs.mp_state)?;
+
+        /* MSRs */
+        self.copy_msrs(&regs.msrs)?;
+
         Ok(())
     }
 }

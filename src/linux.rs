@@ -10,6 +10,7 @@ use std::fs::{File, OpenOptions, remove_file};
 use std::io::{self, stdin};
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 use std::io::stdout;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -665,7 +666,9 @@ pub fn run_config(cfg: Config) -> Result<()> {
     let mut vcpus = Vec::with_capacity(vcpu_count as usize);
     for cpu_id in 0..vcpu_count {
         let vcpu = setup_vcpu(&kvm, &vm, cpu_id, vcpu_count)?;
+        let vcpu_fd = vcpu.as_raw_fd();
         vcpus.push(vcpu);
+        vm.add_vcpu(vcpu_fd);
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
