@@ -420,6 +420,35 @@ impl arch::LinuxArch for X8664arch {
         Ok(())
     }
 
+    fn copy_vcpu(kvm: &Kvm,
+                 vm: &Vm,
+                 regs: &VcpuStateRegs,
+                 cpu_id: u64,
+                 num_cpus: u64)
+                 -> Result<(Vcpu)> {
+        println!("Preparing child vCPU #{}", cpu_id);
+
+        /* Create a new VCPU */
+        let vcpu = Vcpu::new(cpu_id as libc::c_ulong, &kvm, &vm)?;
+
+        /* Set CPUID */
+        let mut kvm_cpuid = kvm.get_supported_cpuid()?;
+        cpuid::filter_cpuid(cpu_id, num_cpus, &mut kvm_cpuid)?;
+        vcpu.set_cpuid2(&kvm_cpuid)?;
+
+        /* Set all state registers */
+        vcpu.set_state_regs(&regs)?;
+
+        /* Set LAPIC */
+        Self::configure_vcpu_pic(&vcpu)?;
+
+        Ok((vcpu))
+    }
+
+    fn configure_vcpu_pic(vcpu: &Vcpu) -> Result<()> {
+        interrupts::set_lint(vcpu)?;
+        Ok(())
+    }
 }
 #[cfg(test)]
 mod tests {

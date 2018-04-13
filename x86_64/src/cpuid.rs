@@ -49,7 +49,7 @@ const ECX_EPB_SHIFT: u32 = 3; // "Energy Performance Bias" bit.
 const ECX_HYPERVISOR_SHIFT: u32 = 31; // Flag to be set when the cpu is running on a hypervisor.
 const EDX_HTT_SHIFT: u32 = 28; // Hyper Threading Enabled.
 
-fn filter_cpuid(cpu_id: u64, cpu_count: u64, kvm_cpuid: &mut kvm::CpuId) -> Result<()> {
+pub fn filter_cpuid(cpu_id: u64, cpu_count: u64, kvm_cpuid: &mut kvm::CpuId) -> Result<()> {
     let entries = kvm_cpuid.mut_entries_slice();
 
     for entry in entries.iter_mut() {

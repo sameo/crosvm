@@ -14,7 +14,7 @@ use std::fs::File;
 use std::result;
 use std::sync::{Arc, Mutex};
 
-use kvm::{Kvm, Vm, Vcpu};
+use kvm::{Kvm, Vm, Vcpu, VcpuStateRegs};
 use sys_util::{EventFd, GuestMemory};
 
 pub type Result<T> = result::Result<T, Box<std::error::Error>>;
@@ -111,4 +111,15 @@ pub trait LinuxArch {
                       cpu_id: u64,
                       num_cpus: u64)
                       -> Result<()>;
+
+    /// Copy a vcpu state into a new vcpu.
+    fn copy_vcpu(kvm: &Kvm,
+                 vm: &Vm,
+                 regs: &VcpuStateRegs,
+                 cpu_id: u64,
+                 num_cpus: u64)
+                 -> Result<(Vcpu)>;
+
+    /// Configures a vcpu interrupt controller.
+    fn configure_vcpu_pic(vcpu: &Vcpu) -> Result<()>;
 }
