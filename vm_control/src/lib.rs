@@ -71,6 +71,8 @@ pub enum VmRequest {
     BalloonAdjust(i32),
     /// Break the VM's run loop and exit.
     Exit,
+    /// Fork the VM.
+    Fork,
     /// Register the given ioevent address along with given datamatch to trigger the `EventFd`.
     RegisterIoevent(EventFd, IoeventAddress, u32),
     /// Register the given IRQ number to be triggered when the `EventFd` is triggered.
@@ -86,6 +88,7 @@ const VM_REQUEST_TYPE_EXIT: u32 = 1;
 const VM_REQUEST_TYPE_REGISTER_MEMORY: u32 = 2;
 const VM_REQUEST_TYPE_UNREGISTER_MEMORY: u32 = 3;
 const VM_REQUEST_TYPE_BALLOON_ADJUST: u32 = 4;
+const VM_REQUEST_TYPE_FORK: u32 = 5;
 const VM_REQUEST_SIZE: usize = 24;
 
 #[repr(C)]
@@ -119,6 +122,7 @@ impl VmRequest {
 
         match req.type_.into() {
             VM_REQUEST_TYPE_EXIT => Ok(VmRequest::Exit),
+            VM_REQUEST_TYPE_FORK => Ok(VmRequest::Fork),
             VM_REQUEST_TYPE_REGISTER_MEMORY => {
                 let fd = fds.pop().ok_or(VmControlError::ExpectFd)?;
                 Ok(VmRequest::RegisterMemory(MaybeOwnedFd::Owned(fd),
@@ -143,6 +147,7 @@ impl VmRequest {
         let mut fd_len = 0;
         match self {
             &VmRequest::Exit => req.type_ = Le32::from(VM_REQUEST_TYPE_EXIT),
+            &VmRequest::Fork => req.type_ = Le32::from(VM_REQUEST_TYPE_FORK),
             &VmRequest::RegisterMemory(ref fd, size) => {
                 req.type_ = Le32::from(VM_REQUEST_TYPE_REGISTER_MEMORY);
                 req.size = Le64::from(size as u64);
@@ -183,6 +188,9 @@ impl VmRequest {
         match self {
             &VmRequest::Exit => {
                 *running = false;
+                VmResponse::Ok
+            }
+            &VmRequest::Fork => {
                 VmResponse::Ok
             }
             &VmRequest::RegisterIoevent(ref evt, addr, datamatch) => {

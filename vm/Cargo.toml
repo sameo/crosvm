@@ -1,0 +1,19 @@
+[package]
+name = "vm"
+version = "0.1.0"
+authors = ["The Chromium OS Authors"]
+
+[dependencies]
+arch = { path = "../arch" }
+byteorder = "*"
+data_model = { path = "../data_model" }
+devices = { path = "../devices" }
+device_manager = { path = "../device_manager" }
+kernel_cmdline = { path = "../kernel_cmdline" }
+kvm = { path = "../kvm" }
+libc = "*"
+net_util = { path = "../net_util" }
+nix = "=0.10.0"
+sys_util = { path = "../sys_util" }
+vm_control = { path = "../vm_control" }
+x86_64 = { path = "../x86_64" }

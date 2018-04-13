@@ -6,17 +6,15 @@ use std;
 use std::ffi::{CString, CStr};
 use std::fmt;
 use std::error;
-use std::fs::{File, OpenOptions, remove_file};
-use std::io::{self, stdin};
+use std::fs::{File, OpenOptions};
+use std::io;
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 use std::io::stdout;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Barrier};
-use std::thread;
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicBool};
+use std::sync::{Arc, Barrier};
 
 use libc;
 
@@ -30,16 +28,15 @@ use qcow::{self, QcowFile};
 use sys_util::*;
 use sys_util;
 use vhost;
-use vm_control::VmRequest;
-
-use Config;
-use DiskType;
+use vm::{self, Config, DiskType, run_control, run_vcpu};
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use arch::LinuxArch;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use x86_64::X8664arch as Arch;
+
+use vm::UnlinkUnixDatagram as VmUnlinkUnixDatagram;
 
 pub enum Error {
     BalloonDeviceNew(devices::virtio::BalloonError),
@@ -72,6 +69,8 @@ pub enum Error {
     RegisterVsock(device_manager::Error),
     RegisterWayland(device_manager::Error),
     RngDeviceNew(devices::virtio::RngError),
+    RunControl(vm::Error),
+    RunVcpu(vm::Error),
     SettingGidMap(io_jail::Error),
     SettingUidMap(io_jail::Error),
     SetTssAddr(sys_util::Error),
@@ -140,6 +139,8 @@ impl fmt::Display for Error {
             }
             &Error::RegisterWayland(ref e) => write!(f, "error registering wayland device: {}", e),
             &Error::RngDeviceNew(ref e) => write!(f, "failed to set up rng: {:?}", e),
+            &Error::RunControl(ref e) => write!(f, "failed to run control loop: {}", e),
+            &Error::RunVcpu(ref e) => write!(f, "failed to run vcpu: {}", e),
             &Error::SettingGidMap(ref e) => write!(f, "error setting GID map: {}", e),
             &Error::SettingUidMap(ref e) => write!(f, "error setting UID map: {}", e),
             &Error::SetTssAddr(ref e) => write!(f, "failed to set TSS address: {:?}", e),
@@ -173,24 +174,6 @@ impl fmt::Display for Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-struct UnlinkUnixDatagram(UnixDatagram);
-impl AsRef<UnixDatagram> for UnlinkUnixDatagram {
-    fn as_ref(&self) -> &UnixDatagram{
-        &self.0
-    }
-}
-impl Drop for UnlinkUnixDatagram {
-    fn drop(&mut self) {
-        if let Ok(addr) = self.0.local_addr() {
-            if let Some(path) = addr.as_pathname() {
-                if let Err(e) = remove_file(path) {
-                    warn!("failed to remove control socket file: {:?}", e);
-                }
-            }
-        }
-    }
-}
-
 fn create_base_minijail(root: &Path, seccomp_policy: &Path) -> Result<Minijail> {
     // All child jails run in a new user namespace without any users mapped,
     // they run as nobody unless otherwise configured.
@@ -223,7 +206,7 @@ fn setup_mmio_bus(cfg: &Config,
                   vm: &mut Vm,
                   mem: &GuestMemory,
                   cmdline: &mut kernel_cmdline::Cmdline,
-                  control_sockets: &mut Vec<UnlinkUnixDatagram>,
+                  control_sockets: &mut Vec<VmUnlinkUnixDatagram>,
                   balloon_device_socket: UnixDatagram)
                   -> Result<devices::Bus> {
     static DEFAULT_PIVOT_ROOT: &'static str = "/var/empty";
@@ -340,7 +323,7 @@ fn setup_mmio_bus(cfg: &Config,
         let jailed_wayland_path = Path::new("/wayland-0");
 
         let (host_socket, device_socket) = UnixDatagram::pair().map_err(Error::CreateSocket)?;
-        control_sockets.push(UnlinkUnixDatagram(host_socket));
+        control_sockets.push(VmUnlinkUnixDatagram(host_socket));
         let wl_box = Box::new(devices::virtio::Wl::new(if cfg.multiprocess {
                                                            &jailed_wayland_path
                                                        } else {
@@ -432,197 +415,6 @@ fn setup_vcpu(kvm: &Kvm,
     Ok(vcpu)
 }
 
-fn run_vcpu(vcpu: Vcpu,
-            cpu_id: u32,
-            start_barrier: Arc<Barrier>,
-            io_bus: devices::Bus,
-            mmio_bus: devices::Bus,
-            exit_evt: EventFd,
-            kill_signaled: Arc<AtomicBool>) -> Result<JoinHandle<()>> {
-    thread::Builder::new()
-        .name(format!("crosvm_vcpu{}", cpu_id))
-        .spawn(move || {
-            unsafe {
-                extern "C" fn handle_signal() {}
-                // Our signal handler does nothing and is trivially async signal safe.
-                register_signal_handler(SIGRTMIN() + 0, handle_signal)
-                    .expect("failed to register vcpu signal handler");
-            }
-
-            start_barrier.wait();
-            loop {
-                let run_res = vcpu.run();
-                match run_res {
-                    Ok(run) => {
-                        match run {
-                            VcpuExit::IoIn(addr, data) => {
-                                io_bus.read(addr as u64, data);
-                            }
-                            VcpuExit::IoOut(addr, data) => {
-                                io_bus.write(addr as u64, data);
-                            }
-                            VcpuExit::MmioRead(addr, data) => {
-                                mmio_bus.read(addr, data);
-                            }
-                            VcpuExit::MmioWrite(addr, data) => {
-                                mmio_bus.write(addr, data);
-                            }
-                            VcpuExit::Hlt => break,
-                            VcpuExit::Shutdown => break,
-                            r => warn!("unexpected vcpu exit: {:?}", r),
-                        }
-                    }
-                    Err(e) => {
-                        match e.errno() {
-                            libc::EAGAIN | libc::EINTR => {},
-                            _ => {
-                                error!("vcpu hit unknown error: {:?}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-                if kill_signaled.load(Ordering::SeqCst) {
-                    break;
-                }
-            }
-            exit_evt
-                .write(1)
-                .expect("failed to signal vcpu exit eventfd");
-        })
-        .map_err(Error::SpawnVcpu)
-}
-
-fn run_control(vm: &mut Vm,
-               control_sockets: Vec<UnlinkUnixDatagram>,
-               next_dev_pfn: &mut u64,
-               stdio_serial: Arc<Mutex<devices::Serial>>,
-               exit_evt: EventFd,
-               sigchld_fd: SignalFd,
-               kill_signaled: Arc<AtomicBool>,
-               vcpu_handles: Vec<JoinHandle<()>>,
-               balloon_host_socket: UnixDatagram,
-               _irqchip_fd: Option<File>)
-               -> Result<()> {
-    const MAX_VM_FD_RECV: usize = 1;
-
-    const EXIT: u32 = 0;
-    const STDIN: u32 = 1;
-    const CHILD_SIGNAL: u32 = 2;
-    const VM_BASE: u32 = 3;
-
-    let stdin_handle = stdin();
-    let stdin_lock = stdin_handle.lock();
-    stdin_lock
-        .set_raw_mode()
-        .expect("failed to set terminal raw mode");
-
-    let mut pollables = Vec::new();
-    pollables.push((EXIT, &exit_evt as &Pollable));
-    pollables.push((STDIN, &stdin_lock as &Pollable));
-    pollables.push((CHILD_SIGNAL, &sigchld_fd as &Pollable));
-    for (i, socket) in control_sockets.iter().enumerate() {
-        pollables.push((VM_BASE + i as u32, socket.as_ref() as &Pollable));
-    }
-
-    let mut poller = Poller::new(pollables.len());
-    let mut scm = Scm::new(MAX_VM_FD_RECV);
-
-    'poll: loop {
-        let tokens = {
-            match poller.poll(&pollables[..]) {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("failed to poll: {:?}", e);
-                    break;
-                }
-            }
-        };
-        for &token in tokens {
-            match token {
-                EXIT => {
-                    info!("vcpu requested shutdown");
-                    break 'poll;
-                }
-                STDIN => {
-                    let mut out = [0u8; 64];
-                    match stdin_lock.read_raw(&mut out[..]) {
-                        Ok(0) => {
-                            // Zero-length read indicates EOF. Remove from pollables.
-                            pollables.retain(|&pollable| pollable.0 != STDIN);
-                        },
-                        Err(e) => {
-                            warn!("error while reading stdin: {:?}", e);
-                            pollables.retain(|&pollable| pollable.0 != STDIN);
-                        },
-                        Ok(count) => {
-                            stdio_serial
-                                .lock()
-                                .unwrap()
-                                .queue_input_bytes(&out[..count])
-                                .expect("failed to queue bytes into serial port");
-                        },
-                    }
-                }
-                CHILD_SIGNAL => {
-                    // Print all available siginfo structs, then exit the loop.
-                    loop {
-                        let result = sigchld_fd.read().map_err(Error::SignalFd)?;
-                        if let Some(siginfo) = result {
-                            error!("child {} died: signo {}, status {}, code {}",
-                                   siginfo.ssi_pid,
-                                   siginfo.ssi_signo,
-                                   siginfo.ssi_status,
-                                   siginfo.ssi_code);
-                        }
-                        break 'poll;
-                    }
-                }
-                t if t >= VM_BASE && t < VM_BASE + (control_sockets.len() as u32) => {
-                    let socket = &control_sockets[(t - VM_BASE) as usize];
-                    match VmRequest::recv(&mut scm, socket.as_ref()) {
-                        Ok(request) => {
-                            let mut running = true;
-                            let response =
-                                request.execute(vm, next_dev_pfn,
-                                                &mut running, &balloon_host_socket);
-                            if let Err(e) = response.send(&mut scm, socket.as_ref()) {
-                                error!("failed to send VmResponse: {:?}", e);
-                            }
-                            if !running {
-                                info!("control socket requested exit");
-                                break 'poll;
-                            }
-                        }
-                        Err(e) => error!("failed to recv VmRequest: {:?}", e),
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // vcpu threads MUST see the kill signaled flag, otherwise they may
-    // re-enter the VM.
-    kill_signaled.store(true, Ordering::SeqCst);
-    for handle in vcpu_handles {
-        match handle.kill(SIGRTMIN() + 0) {
-            Ok(_) => {
-                if let Err(e) = handle.join() {
-                    error!("failed to join vcpu thread: {:?}", e);
-                }
-            }
-            Err(e) => error!("failed to kill vcpu thread: {:?}", e),
-        }
-    }
-
-    stdin_lock
-        .set_canon_mode()
-        .expect("failed to restore canonical mode for terminal");
-
-    Ok(())
-}
-
 pub fn run_config(cfg: Config) -> Result<()> {
     if cfg.multiprocess {
         // Printing something to the syslog before entering minijail so that libc's syslogger has a
@@ -641,7 +433,7 @@ pub fn run_config(cfg: Config) -> Result<()> {
     if let Some(ref path) = cfg.socket_path {
         let path = Path::new(path);
         let control_socket = UnixDatagram::bind(path).map_err(Error::CreateSocket)?;
-        control_sockets.push(UnlinkUnixDatagram(control_socket));
+        control_sockets.push(VmUnlinkUnixDatagram(control_socket));
     }
 
     let kill_signaled = Arc::new(AtomicBool::new(false));
@@ -731,7 +523,7 @@ pub fn run_config(cfg: Config) -> Result<()> {
                               io_bus.clone(),
                               mmio_bus.clone(),
                               exit_evt.try_clone().map_err(Error::CloneEventFd)?,
-                              kill_signaled.clone())?;
+                              kill_signaled.clone()).map_err(|e| Error::RunVcpu(e))?;
         vcpu_handles.push(handle);
     }
     vcpu_thread_barrier.wait();
@@ -745,5 +537,5 @@ pub fn run_config(cfg: Config) -> Result<()> {
                 kill_signaled,
                 vcpu_handles,
                 balloon_host_socket,
-                irq_chip)
+                irq_chip).map_err(|e| Error::RunControl(e))
 }

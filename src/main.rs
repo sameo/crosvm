@@ -21,6 +21,7 @@ extern crate qcow;
 #[macro_use]
 extern crate sys_util;
 extern crate vhost;
+extern crate vm;
 extern crate vm_control;
 extern crate data_model;
 #[cfg(feature = "plugin")]
@@ -33,70 +34,16 @@ pub mod linux;
 #[cfg(feature = "plugin")]
 pub mod plugin;
 
-use std::net;
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
-use std::string::String;
 use std::thread::sleep;
 use std::time::Duration;
 
 use sys_util::{Scm, getpid, kill_process_group, reap_child, syslog};
 
 use argument::{Argument, set_arguments, print_help};
+use vm::{Config, DiskOption, DiskType};
 use vm_control::VmRequest;
-
-static SECCOMP_POLICY_DIR: &'static str = "/usr/share/policy/crosvm";
-
-enum DiskType {
-    FlatFile,
-    Qcow,
-}
-
-struct DiskOption {
-    path: PathBuf,
-    writable: bool,
-    disk_type: DiskType,
-}
-
-pub struct Config {
-    disks: Vec<DiskOption>,
-    vcpu_count: Option<u32>,
-    memory: Option<usize>,
-    kernel_path: PathBuf,
-    params: Vec<String>,
-    host_ip: Option<net::Ipv4Addr>,
-    netmask: Option<net::Ipv4Addr>,
-    mac_address: Option<net_util::MacAddress>,
-    vhost_net: bool,
-    wayland_socket_path: Option<PathBuf>,
-    socket_path: Option<PathBuf>,
-    multiprocess: bool,
-    seccomp_policy_dir: PathBuf,
-    cid: Option<u64>,
-    plugin: Option<PathBuf>,
-}
-
-impl Default for Config {
-    fn default() -> Config {
-        Config {
-            disks: Vec::new(),
-            vcpu_count: None,
-            memory: None,
-            kernel_path: PathBuf::default(),
-            params: Vec::new(),
-            host_ip: None,
-            netmask: None,
-            mac_address: None,
-            vhost_net: false,
-            wayland_socket_path: None,
-            socket_path: None,
-            multiprocess: true,
-            seccomp_policy_dir: PathBuf::from(SECCOMP_POLICY_DIR),
-            cid: None,
-            plugin: None,
-        }
-    }
-}
 
 // Wait for all children to exit. Return true if they have all exited, false
 // otherwise.
@@ -492,11 +439,42 @@ fn balloon_vms(mut args: std::env::Args) -> std::result::Result<(), ()> {
     return_result
 }
 
+fn fork_vm(args: std::env::Args) -> std::result::Result<(), ()> {
+    let mut scm = Scm::new(1);
+    if args.len() == 0 {
+        print_help("crosvm fork", "VM_SOCKET...", &[]);
+        println!("Fork the crosvm instance listening on `VM_SOCKET`.");
+    }
+
+    let mut return_result = Ok(());
+    for socket_path in args {
+        match UnixDatagram::unbound().and_then(|s| {
+                                                   s.connect(&socket_path)?;
+                                                   Ok(s)
+                                               }) {
+            Ok(s) => {
+                if let Err(e) = VmRequest::Fork.send(&mut scm, &s) {
+                    error!("failed to send fork request to socket at '{}': {:?}",
+                           socket_path,
+                           e);
+                }
+            }
+            Err(e) => {
+                error!("failed to connect to socket at '{}': {}", socket_path, e);
+                return_result = Err(());;
+            }
+        }
+    }
+
+    return_result
+}
+
 fn print_usage() {
     print_help("crosvm", "[stop|run]", &[]);
     println!("Commands:");
     println!("    stop - Stops crosvm instances via their control sockets.");
     println!("    run  - Start a new crosvm instance.");
+    println!("    fork - Fork a crosvm instance via its control sockets.");
 }
 
 fn crosvm_main() -> std::result::Result<(), ()> {
@@ -525,6 +503,9 @@ fn crosvm_main() -> std::result::Result<(), ()> {
         }
         Some("balloon") => {
             balloon_vms(args)
+        }
+        Some("fork") => {
+            fork_vm(args)
         }
         Some(c) => {
             println!("invalid subcommand: {:?}", c);

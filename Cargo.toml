@@ -22,10 +22,11 @@ kvm_sys = { path = "kvm_sys" }
 sys_util = { path = "sys_util" }
 kernel_cmdline = { path = "kernel_cmdline" }
 kernel_loader = { path = "kernel_loader" }
-libc = "=0.2.34"
+libc = "=0.2.40"
 byteorder = "=1.1.0"
 net_util = { path = "net_util" }
 vhost = { path = "vhost" }
+vm = { path = "vm" }
 vm_control = { path = "vm_control" }
 data_model = { path = "data_model" }
 qcow = { path = "qcow" }
