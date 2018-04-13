@@ -852,6 +852,78 @@ impl Vcpu {
         Ok(())
     }
 
+    /// Gets the VCPU xsave registers
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    pub fn get_xsave(&self) -> Result<kvm_xsave> {
+        let mut xsave: kvm_xsave = Default::default();
+        let ret = unsafe { ioctl_with_mut_ref(self, KVM_GET_XSAVE(), &mut xsave) };
+        if ret != 0 {
+            return errno_result();
+        }
+        Ok(xsave)
+    }
+
+    /// Sets the VCPU xsave registers
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    pub fn set_xsave(&self, xsave: &kvm_xsave) -> Result<()> {
+        let ret = unsafe {
+            // Here we trust the kernel not to read past the end of the kvm_fpu struct.
+            ioctl_with_ref(self, KVM_SET_XSAVE(), xsave)
+        };
+        if ret < 0 {
+            return errno_result();
+        }
+        Ok(())
+    }
+
+    /// Gets the VCPU extended control registers (XCR)
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    pub fn get_xcrs(&self) -> Result<kvm_xcrs> {
+        let mut xcrs: kvm_xcrs = Default::default();
+        let ret = unsafe { ioctl_with_mut_ref(self, KVM_GET_XCRS(), &mut xcrs) };
+        if ret != 0 {
+            return errno_result();
+        }
+        Ok(xcrs)
+    }
+
+    /// Sets the VCPU extended control registers (XCR)
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    pub fn set_xcrs(&self, xcrs: &kvm_xcrs) -> Result<()> {
+        let ret = unsafe {
+            // Here we trust the kernel not to read past the end of the kvm_fpu struct.
+            ioctl_with_ref(self, KVM_SET_XCRS(), xcrs)
+        };
+        if ret < 0 {
+            return errno_result();
+        }
+        Ok(())
+    }
+
+    /// Gets the VCPU multiprocessing state (MP)
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    pub fn get_mp_state(&self) -> Result<kvm_mp_state> {
+        let mut mp_state: kvm_mp_state = Default::default();
+        let ret = unsafe { ioctl_with_mut_ref(self, KVM_GET_MP_STATE(), &mut mp_state) };
+        if ret != 0 {
+            return errno_result();
+        }
+        Ok(mp_state)
+    }
+
+    /// Sets the VCPU multiprocessing state (MP)
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    pub fn set_mp_state(&self, mp: &kvm_mp_state) -> Result<()> {
+        let ret = unsafe {
+            // Here we trust the kernel not to read past the end of the kvm_fpu struct.
+            ioctl_with_ref(self, KVM_SET_MP_STATE(), mp)
+        };
+        if ret < 0 {
+            return errno_result();
+        }
+        Ok(())
+    }
+
     /// X86 specific call to get the MSRS
     ///
     /// See the documentation for KVM_SET_MSRS.
