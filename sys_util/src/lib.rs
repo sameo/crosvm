@@ -62,6 +62,7 @@ pub use crate::struct_util::*;
 pub use crate::terminal::*;
 pub use crate::timerfd::*;
 pub use poll_token_derive::*;
+pub use sock_ctrl_msg::IntoIovec;
 
 pub use crate::file_traits::{
     AsRawFds, FileAllocate, FileGetLen, FileReadWriteAtVolatile, FileReadWriteVolatile, FileSetLen,

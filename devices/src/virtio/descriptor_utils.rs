@@ -202,6 +202,10 @@ impl<'a> DescriptorChainConsumer<'a> {
             mem: PhantomData,
         })
     }
+
+    fn first_offset(&self) -> Option<*const u8> {
+        self.buffers.get(0).map(|vs| vs.as_ptr() as *const u8)
+    }
 }
 
 /// Provides high-level interface over the sequence of memory regions
@@ -460,6 +464,10 @@ impl<'a> Writer<'a> {
                 bytes_consumed: 0,
             },
         })
+    }
+
+    pub fn first_offset(&self) -> Option<*const u8> {
+        self.buffer.first_offset()
     }
 
     /// Writes an object to the descriptor chain buffer.
