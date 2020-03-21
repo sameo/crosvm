@@ -801,9 +801,19 @@ impl Block {
                 }
             }
             VIRTIO_BLK_T_FLUSH => {
-                disk.fsync().map_err(ExecuteError::Flush)?;
-                flush_timer.clear().map_err(ExecuteError::TimerFd)?;
-                *flush_timer_armed = false;
+                uring_state
+                    .uring_ctx
+                    .add_fsync(disk.as_raw_fds()[0], uring_state.uring_idx)
+                    .unwrap();
+                uring_state
+                    .pending_operations
+                    .insert(uring_state.uring_idx, desc_index);
+                uring_state.uring_idx.wrapping_add(1);
+                uring_state.pending_descriptors.insert(desc_index, 1);
+                uring_state
+                    .status_bytes
+                    .insert(desc_index, (status_addr as *mut u8, None));
+                return Ok(ExecuteComplete::ASync);
             }
             t => return Err(ExecuteError::Unsupported(t)),
         };
