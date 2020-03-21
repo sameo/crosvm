@@ -348,7 +348,7 @@ impl URingContext {
     }
 
     /// Send operations added with the `add_*` functions to the kernel.
-    pub fn submit<'a>(&'a mut self) -> Result<()> {
+    pub fn submit(&mut self) -> Result<()> {
         self.in_flight += self.added;
         self.stats.total_ops = self.stats.total_ops.wrapping_add(self.added as u64);
         if self.added > 0 {

@@ -696,6 +696,7 @@ impl Block {
                     uring_state.uring_idx.wrapping_add(1);
                     num_ops += 1;
                 }
+                uring_state.uring_ctx.submit().unwrap(); // TODO
                 uring_state.pending_descriptors.insert(desc_index, num_ops);
                 uring_state
                     .status_bytes
@@ -733,6 +734,7 @@ impl Block {
                     uring_state.uring_idx.wrapping_add(1);
                     num_ops += 1;
                 }
+                uring_state.uring_ctx.submit().unwrap(); // TODO
                 uring_state.pending_descriptors.insert(desc_index, num_ops);
                 uring_state
                     .status_bytes
