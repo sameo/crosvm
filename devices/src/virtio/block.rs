@@ -237,6 +237,7 @@ impl URingState {
     }
 }
 
+#[derive(Debug, PartialEq)]
 enum ExecuteComplete {
     ASync,
     Sync(usize),
@@ -471,52 +472,8 @@ impl Worker {
                     }
                     Token::Kill => break 'poll,
                     Token::URingReady => {
-                        info!("read the uring");
-                        let events = match self.uring_state.uring_ctx.enter() {
-                            Ok(e) => e,
-                            Err(e) => break 'poll,
-                        };
-
-                        for (id, result) in events {
-                            // update id's status and send the result to the virt queue.
-                            if let Some(desc_index) =
-                                self.uring_state.pending_operations.remove(&id)
-                            {
-                                if result < 0 {
-                                    self.uring_state.status_bytes.get_mut(&desc_index).map(
-                                        |(_, error)| *error = Some(ExecuteError::URing(result)),
-                                    );
-                                }
-                                match self
-                                    .uring_state
-                                    .pending_descriptors
-                                    .remove(&desc_index)
-                                    .unwrap()
-                                {
-                                    1 => {
-                                        //complete now.
-                                        let (status_ptr, error) = self
-                                            .uring_state
-                                            .status_bytes
-                                            .remove(&desc_index)
-                                            .unwrap();
-                                        unsafe {
-                                            //TODO, maybe find the byte from the descriptor index.
-                                            // Safe because we know this pointer points to guest
-                                            // memory.
-                                            *status_ptr = match error {
-                                                None => VIRTIO_BLK_S_OK,
-                                                Some(e) => e.status(),
-                                            }
-                                        }
-                                    }
-                                    remaining => {
-                                        self.uring_state
-                                            .pending_descriptors
-                                            .insert(desc_index, remaining - 1);
-                                    }
-                                }
-                            }
+                        if let Err(e) = Worker::handle_uring_ready(&mut self.uring_state) {
+                            break 'poll;
                         }
                     }
                 }
@@ -525,6 +482,48 @@ impl Worker {
                 self.interrupt.signal_config_changed();
             }
         }
+    }
+
+    fn handle_uring_ready(uring_state: &mut URingState) -> std::result::Result<(), ()> {
+        info!("read the uring");
+        let events = match uring_state.uring_ctx.enter() {
+            Ok(e) => e,
+            Err(e) => return Err(()),
+        };
+
+        for (id, result) in events {
+            // update id's status and send the result to the virt queue.
+            if let Some(desc_index) = uring_state.pending_operations.remove(&id) {
+                if result < 0 {
+                    uring_state
+                        .status_bytes
+                        .get_mut(&desc_index)
+                        .map(|(_, error)| *error = Some(ExecuteError::URing(result)));
+                }
+                match uring_state.pending_descriptors.remove(&desc_index).unwrap() {
+                    1 => {
+                        //complete now.
+                        let (status_ptr, error) =
+                            uring_state.status_bytes.remove(&desc_index).unwrap();
+                        unsafe {
+                            //TODO, maybe find the byte from the descriptor index.
+                            // Safe because we know this pointer points to guest
+                            // memory.
+                            *status_ptr = match error {
+                                None => VIRTIO_BLK_S_OK,
+                                Some(e) => e.status(),
+                            }
+                        }
+                    }
+                    remaining => {
+                        uring_state
+                            .pending_descriptors
+                            .insert(desc_index, remaining - 1);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1066,7 +1065,10 @@ mod tests {
         let mut flush_timer_armed = false;
         let mut uring_state = URingState::new(256);
 
-        Worker::process_one_request(
+        let status_offset = GuestAddress((0x1000 + size_of_val(&req_hdr) + 512) as u64);
+        let status = mem.write_at_addr(&[55u8], status_offset).unwrap();
+
+        let result = Worker::process_one_request(
             avail_desc,
             false,
             true,
@@ -1078,8 +1080,10 @@ mod tests {
             &mut uring_state,
         )
         .expect("execute failed");
+        assert_eq!(result, ExecuteComplete::ASync);
 
-        let status_offset = GuestAddress((0x1000 + size_of_val(&req_hdr) + 512) as u64);
+        Worker::handle_uring_ready(&mut uring_state);
+
         let status = mem.read_obj_from_addr::<u8>(status_offset).unwrap();
         assert_eq!(status, VIRTIO_BLK_S_OK);
     }
