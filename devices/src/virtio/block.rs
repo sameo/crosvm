@@ -352,6 +352,9 @@ impl Worker {
 
             queue.set_notify(&self.mem, true);
         }
+
+        // Send any async operations to the kernel.
+        self.uring_state.uring_ctx.submit().unwrap(); // TODO
     }
 
     fn resize(&mut self, new_size: u64) -> DiskControlResult {
@@ -696,7 +699,6 @@ impl Block {
                     uring_state.uring_idx.wrapping_add(1);
                     num_ops += 1;
                 }
-                uring_state.uring_ctx.submit().unwrap(); // TODO
                 uring_state.pending_descriptors.insert(desc_index, num_ops);
                 uring_state
                     .status_bytes
@@ -734,7 +736,6 @@ impl Block {
                     uring_state.uring_idx.wrapping_add(1);
                     num_ops += 1;
                 }
-                uring_state.uring_ctx.submit().unwrap(); // TODO
                 uring_state.pending_descriptors.insert(desc_index, num_ops);
                 uring_state
                     .status_bytes
