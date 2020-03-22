@@ -214,14 +214,14 @@ impl ExecuteError {
 struct URingState {
     uring_ctx: URingContext,
     uring_idx: u64,
-    // Map an operation to the descriptor waiting for it.
-    pending_operations: BTreeMap<u64, u16>,
-    // Map a pending descriptor to the count of ops needed for completion.
-    pending_descriptors: BTreeMap<u16, usize>,
+    // Map an operation to the queue and descriptor waiting for it.
+    pending_operations: BTreeMap<u64, (usize, u16)>,
+    // Map a pending descriptor to the length and the count of ops needed for completion.
+    pending_descriptors: BTreeMap<u16, (usize, usize)>,
     // Map status bytes that need to be filled to the descriptors that originated them.
-    status_bytes: BTreeMap<u16, (*mut u8, Option<ExecuteError>)>,
+    status_bytes: BTreeMap<u16, (*mut u8, Option<ExecuteError>)>, // result of len or error.
 }
-// TODO - send because it's juse the *u8 status pointers that prevent auto-send. That pointer will
+// TODO - send because it's just the *u8 status pointer that prevent auto-send. That pointer will
 // always be to guest memory so it can be sent where ever we want.
 unsafe impl Send for URingState {}
 
@@ -266,6 +266,7 @@ impl Worker {
         flush_timer_armed: &mut bool,
         mem: &GuestMemory,
         uring_state: &mut URingState,
+        queue_index: usize,
     ) -> result::Result<ExecuteComplete, ExecuteError> {
         let desc_index = avail_desc.index;
         let mut reader = Reader::new(mem, avail_desc.clone()).map_err(ExecuteError::Descriptor)?;
@@ -294,7 +295,9 @@ impl Worker {
             flush_timer_armed,
             uring_state,
             desc_index,
+            queue_index,
             status_addr,
+            available_bytes,
         ) {
             Ok(ExecuteComplete::ASync) => Ok(ExecuteComplete::ASync),
             Ok(ExecuteComplete::Sync(_)) => {
@@ -337,6 +340,7 @@ impl Worker {
                 flush_timer_armed,
                 &self.mem,
                 &mut self.uring_state,
+                queue_index,
             ) {
                 Ok(ExecuteComplete::ASync) => (),
                 Ok(ExecuteComplete::Sync(len)) => {
@@ -475,7 +479,7 @@ impl Worker {
                     }
                     Token::Kill => break 'poll,
                     Token::URingReady => {
-                        if let Err(e) = Worker::handle_uring_ready(&mut self.uring_state) {
+                        if let Err(e) = self.handle_uring_ready() {
                             break 'poll;
                         }
                     }
@@ -487,45 +491,60 @@ impl Worker {
         }
     }
 
-    fn handle_uring_ready(uring_state: &mut URingState) -> std::result::Result<(), ()> {
+    fn handle_uring_ready(&mut self) -> std::result::Result<(), ()> {
         info!("read the uring");
-        let events = match uring_state.uring_ctx.enter() {
+        let events = match self.uring_state.uring_ctx.enter() {
             Ok(e) => e,
             Err(e) => return Err(()),
         };
 
-        for (id, result) in events {
+        for (id, op_res) in events {
+            info!("read the uring id {}", id);
             // update id's status and send the result to the virt queue.
-            if let Some(desc_index) = uring_state.pending_operations.remove(&id) {
-                if result < 0 {
-                    uring_state
+            if let Some((queue_index, desc_index)) = self.uring_state.pending_operations.remove(&id)
+            {
+                info!("read the uring queue {} desc {}", queue_index, desc_index);
+                if op_res < 0 {
+                    self.uring_state
                         .status_bytes
                         .get_mut(&desc_index)
-                        .map(|(_, error)| *error = Some(ExecuteError::URing(result)));
+                        .map(|(_, result)| *result = Some(ExecuteError::URing(op_res)));
                 }
-                match uring_state.pending_descriptors.remove(&desc_index).unwrap() {
-                    1 => {
+                match self
+                    .uring_state
+                    .pending_descriptors
+                    .remove(&desc_index)
+                    .unwrap()
+                {
+                    (len, 1) => {
                         //complete now.
-                        let (status_ptr, error) =
-                            uring_state.status_bytes.remove(&desc_index).unwrap();
+                        let (status_ptr, result) =
+                            self.uring_state.status_bytes.remove(&desc_index).unwrap();
+                        let status = match result {
+                            None => VIRTIO_BLK_S_OK,
+                            Some(e) => e.status(),
+                        };
                         unsafe {
                             //TODO, maybe find the byte from the descriptor index.
                             // Safe because we know this pointer points to guest
                             // memory.
-                            *status_ptr = match error {
-                                None => VIRTIO_BLK_S_OK,
-                                Some(e) => e.status(),
-                            }
+                            *status_ptr = status;
                         }
+                        info!("complete {} {}", queue_index, desc_index);
+                        let queue = &mut self.queues[queue_index];
+                        queue.add_used(&self.mem, desc_index, len as u32);
+                        queue.trigger_interrupt(&self.mem, &self.interrupt);
                     }
-                    remaining => {
-                        uring_state
+                    (len, remaining) => {
+                        info!("read the uring unfinished {}", remaining);
+                        self.uring_state
                             .pending_descriptors
-                            .insert(desc_index, remaining - 1);
+                            .insert(desc_index, (len, remaining - 1));
                     }
                 }
             }
         }
+        info!("done with uring");
         Ok(())
     }
 }
@@ -635,7 +654,9 @@ impl Block {
         flush_timer_armed: &mut bool,
         uring_state: &mut URingState,
         desc_index: u16,
+        queue_index: usize,
         status_addr: *const u8,
+        len: usize,
     ) -> result::Result<ExecuteComplete, ExecuteError> {
         let req_header: virtio_blk_req_header = reader.read_obj().map_err(ExecuteError::Read)?;
 
@@ -679,6 +700,10 @@ impl Block {
                 let iovecs = writer.get_iovec(data_len).unwrap(); //TODO
                 let mut num_ops = 0;
                 for iovec in iovecs.into_iovec() {
+                    info!(
+                        "add read num_ops {} uring id {} queue {} desc {}",
+                        num_ops, uring_state.uring_idx, queue_index, desc_index
+                    );
                     unsafe {
                         // Ok because we know both guest memory and the fd will survive until we
                         // collect the completion.
@@ -695,11 +720,13 @@ impl Block {
                     // this descriptor, and increase the number of pending ops for the descriptor.
                     uring_state
                         .pending_operations
-                        .insert(uring_state.uring_idx, desc_index);
+                        .insert(uring_state.uring_idx, (queue_index, desc_index));
                     uring_state.uring_idx = uring_state.uring_idx.wrapping_add(1);
                     num_ops += 1;
                 }
-                uring_state.pending_descriptors.insert(desc_index, num_ops);
+                uring_state
+                    .pending_descriptors
+                    .insert(desc_index, (len, num_ops));
                 uring_state
                     .status_bytes
                     .insert(desc_index, (status_addr as *mut u8, None));
@@ -716,6 +743,7 @@ impl Block {
                 let iovecs = writer.get_iovec(data_len).unwrap(); //TODO
                 let mut num_ops = 0;
                 for iovec in iovecs.into_iovec() {
+                    info!("add write num_ops {} {}", num_ops, uring_state.uring_idx);
                     unsafe {
                         // Ok because we know both guest memory and the fd will survive until we
                         // collect the completion.
@@ -732,11 +760,13 @@ impl Block {
                     // this descriptor, and increase the number of pending ops for the descriptor.
                     uring_state
                         .pending_operations
-                        .insert(uring_state.uring_idx, desc_index);
+                        .insert(uring_state.uring_idx, (queue_index, desc_index));
                     uring_state.uring_idx = uring_state.uring_idx.wrapping_add(1);
                     num_ops += 1;
                 }
-                uring_state.pending_descriptors.insert(desc_index, num_ops);
+                uring_state
+                    .pending_descriptors
+                    .insert(desc_index, (len, num_ops));
                 uring_state
                     .status_bytes
                     .insert(desc_index, (status_addr as *mut u8, None));
@@ -807,9 +837,9 @@ impl Block {
                     .unwrap();
                 uring_state
                     .pending_operations
-                    .insert(uring_state.uring_idx, desc_index);
+                    .insert(uring_state.uring_idx, (queue_index, desc_index));
                 uring_state.uring_idx = uring_state.uring_idx.wrapping_add(1);
-                uring_state.pending_descriptors.insert(desc_index, 1);
+                uring_state.pending_descriptors.insert(desc_index, (len, 1));
                 uring_state
                     .status_bytes
                     .insert(desc_index, (status_addr as *mut u8, None));
@@ -1091,6 +1121,7 @@ mod tests {
             &mut flush_timer_armed,
             &mem,
             &mut uring_state,
+            0,
         )
         .expect("execute failed");
         assert_eq!(result, ExecuteComplete::ASync);
