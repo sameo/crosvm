@@ -696,7 +696,7 @@ impl Block {
                     uring_state
                         .pending_operations
                         .insert(uring_state.uring_idx, desc_index);
-                    uring_state.uring_idx.wrapping_add(1);
+                    uring_state.uring_idx = uring_state.uring_idx.wrapping_add(1);
                     num_ops += 1;
                 }
                 uring_state.pending_descriptors.insert(desc_index, num_ops);
@@ -711,8 +711,8 @@ impl Block {
                     .checked_shl(u32::from(SECTOR_SHIFT))
                     .ok_or(ExecuteError::OutOfRange)?;
                 check_range(offset, data_len as u64, disk_size)?;
-                // TODO(dgreid 3/18) make reader give the list of addresses in the list.
-                // send reads to uring
+                // TODO(dgreid) make reader give the list of addresses in the list without
+                // allocating.
                 let iovecs = writer.get_iovec(data_len).unwrap(); //TODO
                 let mut num_ops = 0;
                 for iovec in iovecs.into_iovec() {
@@ -722,7 +722,7 @@ impl Block {
                         uring_state.uring_ctx.add_write(
                             iovec.iov_base as *const u8,
                             iovec.iov_len,
-                            disk.as_raw_fds()[0], //TODO - another vec allocation... and composite
+                            disk.as_raw_fds()[0], //TODO - another vec allocation... ind composite
                             offset as usize,
                             uring_state.uring_idx,
                         );
@@ -733,7 +733,7 @@ impl Block {
                     uring_state
                         .pending_operations
                         .insert(uring_state.uring_idx, desc_index);
-                    uring_state.uring_idx.wrapping_add(1);
+                    uring_state.uring_idx = uring_state.uring_idx.wrapping_add(1);
                     num_ops += 1;
                 }
                 uring_state.pending_descriptors.insert(desc_index, num_ops);
@@ -808,7 +808,7 @@ impl Block {
                 uring_state
                     .pending_operations
                     .insert(uring_state.uring_idx, desc_index);
-                uring_state.uring_idx.wrapping_add(1);
+                uring_state.uring_idx = uring_state.uring_idx.wrapping_add(1);
                 uring_state.pending_descriptors.insert(desc_index, 1);
                 uring_state
                     .status_bytes
