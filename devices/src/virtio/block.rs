@@ -530,13 +530,16 @@ impl Worker {
                             // memory.
                             *status_ptr = status;
                         }
-                        info!("complete {} {}", queue_index, desc_index);
+                        info!(
+                            "desc complete queue {} desc {} len {} status {}",
+                            queue_index, desc_index, len, status
+                        );
                         let queue = &mut self.queues[queue_index];
                         queue.add_used(&self.mem, desc_index, len as u32);
                         queue.trigger_interrupt(&self.mem, &self.interrupt);
                     }
                     (len, remaining) => {
-                        info!("read the uring unfinished {}", remaining);
+                        info!("desc unfinished {}", remaining - 1);
                         self.uring_state
                             .pending_descriptors
                             .insert(desc_index, (len, remaining - 1));
@@ -701,8 +704,14 @@ impl Block {
                 let mut num_ops = 0;
                 for iovec in iovecs.into_iovec() {
                     info!(
-                        "add read num_ops {} uring id {} queue {} desc {}",
-                        num_ops, uring_state.uring_idx, queue_index, desc_index
+                        "add read num_ops {} uring id {} queue {} desc {} read ptr {:x} length {} offset {}",
+                        num_ops,
+                        uring_state.uring_idx,
+                        queue_index,
+                        desc_index,
+                        iovec.iov_base as u64,
+                        iovec.iov_len,
+                        offset
                     );
                     unsafe {
                         // Ok because we know both guest memory and the fd will survive until we
@@ -779,6 +788,7 @@ impl Block {
                 return Ok(ExecuteComplete::ASync);
             }
             VIRTIO_BLK_T_DISCARD | VIRTIO_BLK_T_WRITE_ZEROES => {
+                info!("discard");
                 if req_type == VIRTIO_BLK_T_DISCARD && !sparse {
                     // Discard is a hint; if this is a non-sparse disk, just ignore it.
                     return Ok(ExecuteComplete::Sync(0));
@@ -843,6 +853,7 @@ impl Block {
                 uring_state
                     .status_bytes
                     .insert(desc_index, (status_addr as *mut u8, None));
+                info!("add flush {}", uring_state.uring_idx);
                 return Ok(ExecuteComplete::ASync);
             }
             t => return Err(ExecuteError::Unsupported(t)),
