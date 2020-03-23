@@ -22,7 +22,7 @@ use sync::Mutex;
 use sys_util::Error as SysError;
 use sys_util::IntoIovec;
 use sys_util::Result as SysResult;
-use sys_util::{error, info, iov_max, warn, EventFd, GuestMemory, PollContext, PollToken, TimerFd};
+use sys_util::{error, info, iov_max, warn, EventFd, GuestMemory, PollContext, TimerFd};
 use virtio_sys::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_control::{DiskControlCommand, DiskControlResponseSocket, DiskControlResult};
 
@@ -32,7 +32,8 @@ use super::{
 };
 
 const QUEUE_SIZE: u16 = 256;
-const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
+const NUM_QUEUES: u16 = 8;
+const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE; NUM_QUEUES as usize];
 const SECTOR_SHIFT: u8 = 9;
 const SECTOR_SIZE: u64 = 0x01 << SECTOR_SHIFT;
 const MAX_DISCARD_SECTORS: u32 = u32::MAX;
@@ -58,6 +59,7 @@ const VIRTIO_BLK_F_SEG_MAX: u32 = 2;
 const VIRTIO_BLK_F_RO: u32 = 5;
 const VIRTIO_BLK_F_BLK_SIZE: u32 = 6;
 const VIRTIO_BLK_F_FLUSH: u32 = 9;
+const VIRTIO_BLK_F_MQ: u32 = 12;
 const VIRTIO_BLK_F_DISCARD: u32 = 13;
 const VIRTIO_BLK_F_WRITE_ZEROES: u32 = 14;
 
@@ -94,7 +96,8 @@ struct virtio_blk_config {
     blk_size: Le32,
     topology: virtio_blk_topology,
     writeback: u8,
-    unused0: [u8; 3],
+    unused0: u8,
+    num_queues: u16,
     max_discard_sectors: Le32,
     max_discard_seg: Le32,
     discard_sector_alignment: Le32,
@@ -213,7 +216,7 @@ struct URingState {
     // Map an operation to the queue and descriptor waiting for it.
     pending_operations: BTreeMap<u64, (usize, u16)>,
     // Map a pending descriptor to the length and the count of ops needed for completion.
-    pending_descriptors: BTreeMap<u16, (usize, usize)>,
+    pending_descriptors: BTreeMap<(usize, u16), (usize, usize)>,
     // Map status bytes that need to be filled to the descriptors that originated them.
     status_bytes: BTreeMap<u16, (*mut u8, Option<ExecuteError>)>, // result of len or error.
 }
@@ -385,16 +388,13 @@ impl Worker {
         DiskControlResult::Ok
     }
 
-    fn run(&mut self, queue_evt: EventFd, kill_evt: EventFd) {
-        #[derive(PollToken)]
-        enum Token {
-            FlushTimer,
-            QueueAvailable,
-            ControlRequest,
-            InterruptResample,
-            Kill,
-            URingReady,
-        }
+    fn run(&mut self, queue_evts: Vec<EventFd>, kill_evt: EventFd) {
+        const FLUSH_TIMER: u64 = 0u64;
+        const CONTROL_REQUEST: u64 = 1u64;
+        const INTERRUPT_RESAMPLE: u64 = 2u64;
+        const KILL: u64 = 3u64;
+        const URING_READY: u64 = 4u64;
+        const QUEUE_AVAILABLE: u64 = 5u64;
 
         let mut flush_timer = match TimerFd::new() {
             Ok(t) => t,
@@ -405,13 +405,12 @@ impl Worker {
         };
         let mut flush_timer_armed = false;
 
-        let poll_ctx: PollContext<Token> = match PollContext::build_with(&[
-            (&flush_timer, Token::FlushTimer),
-            (&queue_evt, Token::QueueAvailable),
-            (&self.control_socket, Token::ControlRequest),
-            (self.interrupt.get_resample_evt(), Token::InterruptResample),
-            (&kill_evt, Token::Kill),
-            (&self.uring_state.uring_ctx, Token::URingReady),
+        let poll_ctx: PollContext<u64> = match PollContext::build_with(&[
+            (&flush_timer, FLUSH_TIMER),
+            (&self.control_socket, CONTROL_REQUEST),
+            (self.interrupt.get_resample_evt(), INTERRUPT_RESAMPLE),
+            (&kill_evt, KILL),
+            (&self.uring_state.uring_ctx, URING_READY),
         ]) {
             Ok(pc) => pc,
             Err(e) => {
@@ -419,6 +418,10 @@ impl Worker {
                 return;
             }
         };
+
+        for (i, evt) in queue_evts.iter().enumerate() {
+            poll_ctx.add(evt, QUEUE_AVAILABLE + i as u64).unwrap();
+        }
 
         'poll: loop {
             let events = match poll_ctx.wait() {
@@ -432,7 +435,7 @@ impl Worker {
             let mut needs_config_interrupt = false;
             for event in events.iter_readable() {
                 match event.token() {
-                    Token::FlushTimer => {
+                    FLUSH_TIMER => {
                         if let Err(e) = self.disk_image.fsync() {
                             error!("Failed to flush the disk: {}", e);
                             break 'poll;
@@ -442,14 +445,7 @@ impl Worker {
                             break 'poll;
                         }
                     }
-                    Token::QueueAvailable => {
-                        if let Err(e) = queue_evt.read() {
-                            error!("failed reading queue EventFd: {}", e);
-                            break 'poll;
-                        }
-                        self.process_queue(0, &mut flush_timer, &mut flush_timer_armed);
-                    }
-                    Token::ControlRequest => {
+                    CONTROL_REQUEST => {
                         let req = match self.control_socket.recv() {
                             Ok(req) => req,
                             Err(e) => {
@@ -470,11 +466,11 @@ impl Worker {
                             break 'poll;
                         }
                     }
-                    Token::InterruptResample => {
+                    INTERRUPT_RESAMPLE => {
                         self.interrupt.interrupt_resample();
                     }
-                    Token::Kill => break 'poll,
-                    Token::URingReady => {
+                    KILL => break 'poll,
+                    URING_READY => {
                         let queues = &mut self.queues;
                         let mem = &self.mem;
                         let interrupt = &self.interrupt;
@@ -489,6 +485,15 @@ impl Worker {
                             error!("Error processing uring events");
                             break 'poll;
                         }
+                    }
+                    // All other are queue notifications.
+                    n => {
+                        let queue_index = (n - QUEUE_AVAILABLE) as usize;
+                        if let Err(e) = queue_evts[queue_index].read() {
+                            error!("failed reading queue EventFd: {}", e);
+                            break 'poll;
+                        }
+                        self.process_queue(queue_index, &mut flush_timer, &mut flush_timer_armed);
                     }
                 }
             }
@@ -516,7 +521,11 @@ impl Worker {
                         .get_mut(&desc_index)
                         .map(|(_, result)| *result = Some(ExecuteError::URing(op_res)));
                 }
-                match uring_state.pending_descriptors.remove(&desc_index).unwrap() {
+                match uring_state
+                    .pending_descriptors
+                    .remove(&(queue_index, desc_index))
+                    .unwrap()
+                {
                     (len, 1) => {
                         //complete now.
                         let (status_ptr, result) =
@@ -536,7 +545,7 @@ impl Worker {
                     (len, remaining) => {
                         uring_state
                             .pending_descriptors
-                            .insert(desc_index, (len, remaining - 1));
+                            .insert((queue_index, desc_index), (len, remaining - 1));
                     }
                 }
             }
@@ -565,6 +574,7 @@ fn build_config_space(disk_size: u64, seg_max: u32, block_size: u32) -> virtio_b
         capacity: Le64::from(disk_size >> SECTOR_SHIFT),
         seg_max: Le32::from(seg_max),
         blk_size: Le32::from(block_size),
+        num_queues: NUM_QUEUES,
         max_discard_sectors: Le32::from(MAX_DISCARD_SECTORS),
         discard_sector_alignment: Le32::from(DISCARD_SECTOR_ALIGNMENT),
         max_write_zeroes_sectors: Le32::from(MAX_WRITE_ZEROES_SECTORS),
@@ -613,6 +623,7 @@ impl Block {
         avail_features |= 1 << VIRTIO_F_VERSION_1;
         avail_features |= 1 << VIRTIO_BLK_F_SEG_MAX;
         avail_features |= 1 << VIRTIO_BLK_F_BLK_SIZE;
+        avail_features |= 1 << VIRTIO_BLK_F_MQ;
 
         let seg_max = min(max(iov_max(), 1), u32::max_value() as usize) as u32;
 
@@ -722,7 +733,7 @@ impl Block {
                 if num_ops > 0 {
                     uring_state
                         .pending_descriptors
-                        .insert(desc_index, (len, num_ops));
+                        .insert((queue_index, desc_index), (len, num_ops));
                     uring_state
                         .status_bytes
                         .insert(desc_index, (status_addr as *mut u8, None));
@@ -767,7 +778,7 @@ impl Block {
                 if num_ops > 0 {
                     uring_state
                         .pending_descriptors
-                        .insert(desc_index, (len, num_ops));
+                        .insert((queue_index, desc_index), (len, num_ops));
                     uring_state
                         .status_bytes
                         .insert(desc_index, (status_addr as *mut u8, None));
@@ -842,7 +853,9 @@ impl Block {
                     .pending_operations
                     .insert(uring_state.uring_idx, (queue_index, desc_index));
                 uring_state.uring_idx = uring_state.uring_idx.wrapping_add(1);
-                uring_state.pending_descriptors.insert(desc_index, (len, 1));
+                uring_state
+                    .pending_descriptors
+                    .insert((queue_index, desc_index), (len, 1));
                 uring_state
                     .status_bytes
                     .insert(desc_index, (status_addr as *mut u8, None));
@@ -907,12 +920,9 @@ impl VirtioDevice for Block {
         mem: GuestMemory,
         interrupt: Interrupt,
         queues: Vec<Queue>,
-        mut queue_evts: Vec<EventFd>,
+        queue_evts: Vec<EventFd>,
     ) {
-        if queues.len() != 1 || queue_evts.len() != 1 {
-            return;
-        }
-
+        info!("have {} queues for block", queues.len());
         let (self_kill_evt, kill_evt) = match EventFd::new().and_then(|e| Ok((e.try_clone()?, e))) {
             Ok(v) => v,
             Err(e) => {
@@ -940,9 +950,9 @@ impl VirtioDevice for Block {
                                 read_only,
                                 sparse,
                                 control_socket,
-                                uring_state: URingState::new(256), //TODO
+                                uring_state: URingState::new(256), //TODO pick a size intelligently.
                             };
-                            worker.run(queue_evts.remove(0), kill_evt);
+                            worker.run(queue_evts, kill_evt);
                             worker
                         });
 
