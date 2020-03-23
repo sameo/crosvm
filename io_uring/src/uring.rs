@@ -125,7 +125,7 @@ impl URingContext {
                 MemoryMapping::from_fd_offset_flags(
                     &ring_file,
                     ring_params.cq_off.cqes as usize
-                        + ring_params.cq_entries as usize * std::mem::size_of::<u32>(),
+                        + ring_params.cq_entries as usize * std::mem::size_of::<io_uring_cqe>(),
                     IORING_OFF_CQ_RING as usize,
                     libc::MAP_SHARED | libc::MAP_POPULATE,
                     Protection::read_write(),
@@ -551,34 +551,36 @@ mod tests {
     fn read_one_block_at_a_time() {
         let tempdir = TempDir::new().unwrap();
         let file_path = append_file_name(tempdir.path(), "test");
+        let queue_size = 128;
 
-        let mut uring = URingContext::new(16).unwrap();
-        let mut buf = [0u8; 4096];
-        let mut f = OpenOptions::new()
+        let mut uring = URingContext::new(queue_size).unwrap();
+        let mut buf = [0u8; 0x1000];
+        let f = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&file_path)
             .unwrap();
-        f.write(&buf).unwrap();
-        f.write(&buf).unwrap();
-        f.write(&buf).unwrap();
+        f.set_len(0x1000 * 2).unwrap();
 
-        unsafe {
-            // Safe because the `enter` call waits until the kernel is done mutating `buf`.
-            uring
-                .add_read(buf.as_mut_ptr(), buf.len(), f.as_raw_fd(), 0, 55)
-                .unwrap();
-            assert_eq!(uring.enter().unwrap().next(), Some((55, buf.len() as i32)));
-            uring
-                .add_read(buf.as_mut_ptr(), buf.len(), f.as_raw_fd(), 0, 56)
-                .unwrap();
-            assert_eq!(uring.enter().unwrap().next(), Some((56, buf.len() as i32)));
-            uring
-                .add_read(buf.as_mut_ptr(), buf.len(), f.as_raw_fd(), 0, 57)
-                .unwrap();
-            assert_eq!(uring.enter().unwrap().next(), Some((57, buf.len() as i32)));
+        for i in 0..queue_size * 2 {
+            unsafe {
+                // Safe because the `enter` call waits until the kernel is done mutating `buf`.
+                uring
+                    .add_read(
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                        f.as_raw_fd(),
+                        (i % 2) * 0x1000,
+                        i as u64,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    uring.enter().unwrap().next(),
+                    Some((i as u64, buf.len() as i32))
+                );
+            }
         }
     }
 
