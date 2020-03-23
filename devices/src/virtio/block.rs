@@ -502,17 +502,14 @@ impl Worker {
         uring_state: &mut URingState,
         mut queue_complete: impl FnMut(usize, u16, usize),
     ) -> std::result::Result<(), ()> {
-        info!("read the uring");
         let events = match uring_state.uring_ctx.enter() {
             Ok(e) => e,
             Err(_) => return Err(()),
         };
 
         for (id, op_res) in events {
-            info!("read the uring id {}", id);
             // update id's status and send the result to the virt queue.
             if let Some((queue_index, desc_index)) = uring_state.pending_operations.remove(&id) {
-                info!("read the uring queue {} desc {}", queue_index, desc_index);
                 if op_res < 0 {
                     uring_state
                         .status_bytes
@@ -534,14 +531,9 @@ impl Worker {
                             // memory.
                             *status_ptr = status;
                         }
-                        info!(
-                            "desc complete queue {} desc {} len {} status {}",
-                            queue_index, desc_index, len, status
-                        );
                         queue_complete(queue_index, desc_index, len);
                     }
                     (len, remaining) => {
-                        info!("desc unfinished {}", remaining - 1);
                         uring_state
                             .pending_descriptors
                             .insert(desc_index, (len, remaining - 1));
@@ -549,7 +541,6 @@ impl Worker {
                 }
             }
         }
-        info!("done with uring");
         Ok(())
     }
 }
@@ -705,16 +696,6 @@ impl Block {
                 let iovecs = writer.get_iovec(data_len).unwrap(); //TODO
                 let mut num_ops = 0;
                 for iovec in iovecs.into_iovec() {
-                    info!(
-                        "add read num_ops {} uring id {} queue {} desc {} read ptr {:x} length {} offset {}",
-                        num_ops,
-                        uring_state.uring_idx,
-                        queue_index,
-                        desc_index,
-                        iovec.iov_base as u64,
-                        iovec.iov_len,
-                        offset
-                    );
                     unsafe {
                         // Ok because we know both guest memory and the fd will survive until we
                         // collect the completion.
@@ -738,13 +719,16 @@ impl Block {
                     uring_state.uring_idx = uring_state.uring_idx.wrapping_add(1);
                     num_ops += 1;
                 }
-                uring_state
-                    .pending_descriptors
-                    .insert(desc_index, (len, num_ops));
-                uring_state
-                    .status_bytes
-                    .insert(desc_index, (status_addr as *mut u8, None));
-                return Ok(ExecuteComplete::ASync);
+                if num_ops > 0 {
+                    uring_state
+                        .pending_descriptors
+                        .insert(desc_index, (len, num_ops));
+                    uring_state
+                        .status_bytes
+                        .insert(desc_index, (status_addr as *mut u8, None));
+                    return Ok(ExecuteComplete::ASync);
+                }
+                // If no ops were added, assume this is a synchronous operation.
             }
             VIRTIO_BLK_T_OUT => {
                 let data_len = reader.available_bytes();
@@ -757,7 +741,6 @@ impl Block {
                 let iovecs = writer.get_iovec(data_len).unwrap(); //TODO
                 let mut num_ops = 0;
                 for iovec in iovecs.into_iovec() {
-                    info!("add write num_ops {} {}", num_ops, uring_state.uring_idx);
                     unsafe {
                         // Ok because we know both guest memory and the fd will survive until we
                         // collect the completion.
@@ -781,22 +764,24 @@ impl Block {
                     uring_state.uring_idx = uring_state.uring_idx.wrapping_add(1);
                     num_ops += 1;
                 }
-                uring_state
-                    .pending_descriptors
-                    .insert(desc_index, (len, num_ops));
-                uring_state
-                    .status_bytes
-                    .insert(desc_index, (status_addr as *mut u8, None));
-                if !*flush_timer_armed {
-                    flush_timer
-                        .reset(flush_delay, None)
-                        .map_err(ExecuteError::TimerFd)?;
-                    *flush_timer_armed = true;
+                if num_ops > 0 {
+                    uring_state
+                        .pending_descriptors
+                        .insert(desc_index, (len, num_ops));
+                    uring_state
+                        .status_bytes
+                        .insert(desc_index, (status_addr as *mut u8, None));
+                    if !*flush_timer_armed {
+                        flush_timer
+                            .reset(flush_delay, None)
+                            .map_err(ExecuteError::TimerFd)?;
+                        *flush_timer_armed = true;
+                    }
+                    return Ok(ExecuteComplete::ASync);
                 }
-                return Ok(ExecuteComplete::ASync);
+                // If no ops were added, assume this is a synchronous operation.
             }
             VIRTIO_BLK_T_DISCARD | VIRTIO_BLK_T_WRITE_ZEROES => {
-                info!("discard");
                 if req_type == VIRTIO_BLK_T_DISCARD && !sparse {
                     // Discard is a hint; if this is a non-sparse disk, just ignore it.
                     return Ok(ExecuteComplete::Sync(0));
@@ -861,7 +846,6 @@ impl Block {
                 uring_state
                     .status_bytes
                     .insert(desc_index, (status_addr as *mut u8, None));
-                info!("add flush {}", uring_state.uring_idx);
                 return Ok(ExecuteComplete::ASync);
             }
             t => return Err(ExecuteError::Unsupported(t)),
